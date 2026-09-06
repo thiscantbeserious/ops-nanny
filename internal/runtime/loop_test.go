@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -723,7 +725,7 @@ func TestPruneAgyLogs(t *testing.T) {
 	logWriter = &logBuf
 	defer func() { logWriter = nil }()
 
-	pruneAgyLogs(&config.Config{AgyHome: home}, newLogger(logCfg))
+	pruneAgyHome(&config.Config{AgyHome: home}, newLogger(logCfg))
 
 	// The count line is what makes a wrong path visible instead of a
 	// silent no-op. It carries the directory name and a number, no
@@ -771,8 +773,73 @@ func TestPruneAgyLogs(t *testing.T) {
 	if fi, err := os.Lstat(token); err != nil || !fi.ModTime().Equal(tokenBefore.ModTime()) {
 		t.Errorf("the credential's mtime changed across the prune: err=%v", err)
 	}
-	if _, err := os.Stat(filepath.Join(base, "brain")); err != nil {
-		t.Errorf("unrelated agy state must survive: %v", err)
+	if _, err := os.Lstat(filepath.Join(base, "brain")); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("agy's conversation state must be gone after the prune: err=%v", err)
+	}
+}
+
+// Every accumulated-state entry goes, files and directories alike, while
+// a symlink standing in an entry's place is skipped and its target is
+// never touched, whether it points outside the home or at the credential.
+func TestPruneAgyHome_ClearsConversationState(t *testing.T) {
+	home, base, token := agyHomeFixture(t, 1)
+	for _, d := range []string{"conversations/c1", "knowledge", "implicit"} {
+		if err := os.MkdirAll(filepath.Join(base, d), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, f := range []string{"conversations/c1/turn.json", "conversation_summaries.db", "conversation_summaries.db-wal", "history.jsonl", "installation_id", "settings.json"} {
+		if err := os.WriteFile(filepath.Join(base, f), []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// brain replaced by a link to a tree outside the home.
+	outside := t.TempDir()
+	if err := os.WriteFile(filepath.Join(outside, "artifact"), []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(filepath.Join(base, "brain")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(base, "brain")); err != nil {
+		t.Fatal(err)
+	}
+	// conversation_summaries.db-shm replaced by a link to the credential.
+	if err := os.Symlink(token, filepath.Join(base, "conversation_summaries.db-shm")); err != nil {
+		t.Fatal(err)
+	}
+
+	logCfg := testConfig(t, tick0)
+	logCfg.LogLevel = "DEBUG"
+	var logBuf bytes.Buffer
+	logWriter = &logBuf
+	defer func() { logWriter = nil }()
+
+	pruneAgyHome(&config.Config{AgyHome: home}, newLogger(logCfg))
+
+	for _, gone := range []string{"conversations", "knowledge", "implicit", "conversation_summaries.db", "conversation_summaries.db-wal", "history.jsonl"} {
+		if _, err := os.Lstat(filepath.Join(base, gone)); !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("%s must be removed: err=%v", gone, err)
+		}
+	}
+	if got := logBuf.String(); !strings.Contains(got, "runtime cleared agy state removed=6") {
+		t.Errorf("debug count line missing or wrong:\n%s", got)
+	}
+	for _, kept := range []string{"brain", "conversation_summaries.db-shm"} {
+		if fi, err := os.Lstat(filepath.Join(base, kept)); err != nil || fi.Mode()&os.ModeSymlink == 0 {
+			t.Errorf("a symlink in %s's place must be skipped, not removed: %v", kept, err)
+		}
+	}
+	if data, err := os.ReadFile(filepath.Join(outside, "artifact")); err != nil || string(data) != "keep" {
+		t.Errorf("the link target outside the home was touched: %v", err)
+	}
+	if data, err := os.ReadFile(token); err != nil || string(data) != "secret" {
+		t.Errorf("the credential must never be touched: err=%v", err)
+	}
+	for _, kept := range []string{"installation_id", "settings.json"} {
+		if _, err := os.Lstat(filepath.Join(base, kept)); err != nil {
+			t.Errorf("%s must survive: %v", kept, err)
+		}
 	}
 }
 
@@ -853,7 +920,7 @@ func symlinkInRootProbe(t *testing.T, link string) {
 	logWriter = &logBuf
 	defer func() { logWriter = nil }()
 
-	pruneAgyLogs(&config.Config{AgyHome: home}, newLogger(logCfg))
+	pruneAgyHome(&config.Config{AgyHome: home}, newLogger(logCfg))
 
 	if _, err := os.Lstat(victim); err != nil {
 		t.Fatalf("in-root %s link: the prune followed the link and deleted the oldest file where it landed: %v", link, err)
@@ -865,8 +932,11 @@ func symlinkInRootProbe(t *testing.T, link string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(after) != len(before) {
-		t.Errorf("in-root %s link: %d entries before, %d after", link, len(before), len(after))
+	// In the `log -> .` case the victim directory is antigravity-cli
+	// itself, whose brain/ the state clear removes by design. Count what
+	// the log prune could have touched.
+	if n, m := countNotState(before), countNotState(after); n != m {
+		t.Errorf("in-root %s link: %d entries before, %d after", link, n, m)
 	}
 	if !strings.Contains(logBuf.String(), "a path component is a symlink") {
 		t.Errorf("in-root %s link: refused silently, want the debug reason:\n%s", link, logBuf.String())
@@ -917,7 +987,7 @@ func symlinkEscapeProbe(t *testing.T, link string) {
 		t.Fatal(err)
 	}
 
-	pruneAgyLogs(&config.Config{AgyHome: home}, logger)
+	pruneAgyHome(&config.Config{AgyHome: home}, logger)
 
 	if entries, _ := os.ReadDir(outside); len(entries) != 30 {
 		t.Fatalf("prune followed the symlinked %s out of $AGY_HOME: %d of 30 files remain outside", link, len(entries))
@@ -945,7 +1015,7 @@ func TestPruneAgyLogsToleratesMissingAndSmallDirs(t *testing.T) {
 	logger := newLogger(logCfg)
 
 	// An absent home is a no-op that still says so.
-	pruneAgyLogs(&config.Config{AgyHome: filepath.Join(t.TempDir(), "absent")}, logger)
+	pruneAgyHome(&config.Config{AgyHome: filepath.Join(t.TempDir(), "absent")}, logger)
 	if got := logBuf.String(); !strings.Contains(got, "runtime agy home not pruned") {
 		t.Errorf("absent AGY_HOME produced no debug signal:\n%s", got)
 	}
@@ -958,7 +1028,7 @@ func TestPruneAgyLogsToleratesMissingAndSmallDirs(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(wrong, ".gemini", "antigravity-v2", "log"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	pruneAgyLogs(&config.Config{AgyHome: wrong}, logger)
+	pruneAgyHome(&config.Config{AgyHome: wrong}, logger)
 	// The reason is the real one, a missing path, not a symlink accusation
 	// that would send an operator looking for an attack on a fresh volume.
 	if got := logBuf.String(); !strings.Contains(got, "runtime agy dir not pruned dir=log") || !strings.Contains(got, "no such file or directory") || strings.Contains(got, "symlink") {
@@ -969,7 +1039,12 @@ func TestPruneAgyLogsToleratesMissingAndSmallDirs(t *testing.T) {
 	// nothing at all: no per-tick noise on a healthy volume.
 	logBuf.Reset()
 	home, base, _ := agyHomeFixture(t, 1)
-	pruneAgyLogs(&config.Config{AgyHome: home}, logger)
+	// The fixture's brain/ would be cleared and counted, so drop it first:
+	// silence is asserted for a home with nothing to do.
+	if err := os.RemoveAll(filepath.Join(base, "brain")); err != nil {
+		t.Fatal(err)
+	}
+	pruneAgyHome(&config.Config{AgyHome: home}, logger)
 	if entries, _ := os.ReadDir(filepath.Join(base, "log")); len(entries) != 1 {
 		t.Errorf("a directory under the cap must be left alone, got %d files", len(entries))
 	}
@@ -1033,4 +1108,15 @@ func TestTick_PrunesAgyLogs(t *testing.T) {
 	if entries, _ := os.ReadDir(filepath.Join(base, "log")); len(entries) != 20 {
 		t.Errorf("after one direct Tick: %d log files, want 20 (prune not wired into Tick)", len(entries))
 	}
+}
+
+// countNotState counts directory entries that are not agy state entries.
+func countNotState(entries []os.DirEntry) int {
+	n := 0
+	for _, e := range entries {
+		if !slices.Contains(agyStateEntries, e.Name()) {
+			n++
+		}
+	}
+	return n
 }

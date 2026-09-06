@@ -206,8 +206,26 @@ func seedAgyHome(cfg *config.Config, logger warner) {
 // ticks, enough to diagnose a failure that was noticed in the next report.
 const agyLogKeep = 20
 
-// pruneAgyLogs unlinks all but the newest agyLogKeep entries in agy's log
-// and crashes directories, oldest first by mtime. Their names carry a pid
+// agyStateEntries is what agy accumulates across conversations under
+// antigravity-cli: its artifact store, conversation transcripts, knowledge
+// items, implicit memory, presence markers, the summary database with its journal files and
+// the prompt history. Each tick is a fresh question about fresh facts, so
+// none of it is wanted, and keeping it is harmful twice over. Every entry
+// is read back into the next prompt, which grew from 20k to 83k input
+// tokens over a few dozen ticks. And once the store holds content the
+// model starts asking for a shell to look at it (`ls -la .../brain/*/`),
+// which the deny policy turns into a failed attempt. The credential, the
+// installation id, settings and the binaries agy keeps beside them are not
+// on this list and are never touched.
+var agyStateEntries = []string{
+	"brain", "conversations", "knowledge", "implicit", "presence",
+	"conversation_summaries.db", "conversation_summaries.db-wal", "conversation_summaries.db-shm",
+	"history.jsonl",
+}
+
+// pruneAgyHome unlinks all but the newest agyLogKeep entries in agy's log
+// and crashes directories, oldest first by mtime, then removes every
+// agyStateEntries entry outright. Their names carry a pid
 // and a uuid rather than only a timestamp, so mtime is the ordering that
 // holds for both.
 //
@@ -228,7 +246,7 @@ const agyLogKeep = 20
 // a tick. The removed count is logged at debug level so a wrong path or a
 // changed agy layout does not become a silent no-op. A count is not
 // content.
-func pruneAgyLogs(cfg *config.Config, logger *slog.Logger) {
+func pruneAgyHome(cfg *config.Config, logger *slog.Logger) {
 	root, err := os.OpenRoot(cfg.AgyHome)
 	if err != nil {
 		// The most literal wrong path of all. SeedAgyHome warns on the
@@ -291,6 +309,37 @@ func pruneAgyLogs(cfg *config.Config, logger *slog.Logger) {
 			}
 		}
 		logger.Debug("runtime pruned agy files", "dir", sub, "removed", removed)
+	}
+
+	// The state entries live directly under antigravity-cli, with the same
+	// two parent components guarded as above. A symlink in the entry's own
+	// place is skipped rather than removed, so the prune never has an
+	// opinion about where a link points. RemoveAll through os.Root stays
+	// inside the home for everything below the entry.
+	cli := filepath.Join(".gemini", "antigravity-cli")
+	if err := realDirs(root, ".gemini", cli); err != nil {
+		if !errors.Is(err, fs.ErrNotExist) {
+			logger.Debug("runtime agy state not cleared", "error", err)
+		}
+		return
+	}
+	removed := 0
+	for _, name := range agyStateEntries {
+		p := filepath.Join(cli, name)
+		fi, err := root.Lstat(p)
+		if err != nil {
+			continue
+		}
+		if fi.Mode()&os.ModeSymlink != 0 {
+			logger.Debug("runtime agy state not cleared", "entry", name, "error", errNotRealDir)
+			continue
+		}
+		if root.RemoveAll(p) == nil {
+			removed++
+		}
+	}
+	if removed > 0 {
+		logger.Debug("runtime cleared agy state", "removed", removed)
 	}
 }
 

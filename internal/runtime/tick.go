@@ -88,7 +88,7 @@ func Tick(ctx context.Context, cfg *config.Config, seq int64, d Deps) TickResult
 	// Housekeeping before the tick's own work, here rather than in Loop
 	// so a direct --once invocation prunes exactly as the loop does (C4:
 	// "before each tick").
-	pruneAgyLogs(cfg, logger)
+	pruneAgyHome(cfg, logger)
 	if seq == 0 {
 		// R3.1: "$STATE_DIR/tick-seq ... owned exclusively by tick ...
 		// read, incremented and written atomically before step 1." The
